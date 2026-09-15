@@ -1,0 +1,27 @@
+name: turtle-test
+on:
+  workflow_dispatch: {}
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 의존성 설치
+        run: pip install -r requirements.txt
+      - name: 1) 야후 일봉 (소수 종목)
+        run: python3 live/yahoo_daily.py --symbols AAPL,MSFT,NVDA,KLAC,PFG --pause 0.3
+      - name: 2) 기준가 계산
+        run: python3 live/turtle_levels.py --symbols AAPL,MSFT,NVDA,KLAC,PFG --data-dir data/prices_yahoo --out levels_test
+      - name: 3) 짧은 스트리밍 (2분)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python3 live/turtle_live_stream.py --levels live/out/levels_test.csv --symbols AAPL,MSFT,NVDA,KLAC,PFG --per-conn 100 --minutes 2 --security-class live/security_class.csv
+      - name: 4) 텔레그램 [테스트] 발송
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python3 ci_telegram_test.py

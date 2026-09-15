@@ -1,0 +1,10 @@
+data/
+live/out/
+live/out_yahoo/
+__pycache__/
+*.pyc
+positions.csv
+account.json
+refdata/
+*.zip
+.turtle_telegram
