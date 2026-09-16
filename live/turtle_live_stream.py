@@ -364,6 +364,21 @@ if __name__ == "__main__":
     ap.add_argument("--no-telegram", action="store_true", help="텔레그램 발송 끄기(감시만)")
     ap.add_argument("--test", action="store_true", help="시험모드: 보유 알림 [테스트] 접두+별도 이력, 실 진입알림 발송 안 함")
     a = ap.parse_args()
+    # ---- 로컬 단일 실행 잠금(판호 승인): 시세 연결·알림 발송 전에 먼저 확인 ----
+    # 실사용 감시 시작 경로(0번·29번 등)는 모두 이 지점을 지나므로 같은 잠금을 공유한다.
+    # 획득 실패 시 기존 감시를 자동 종료하지 않고, 새 감시만 시작하지 않는다.
+    import single_lock
+    _lock_fd, _prev = single_lock.acquire(
+        os.path.join(OUT, ".turtle_watch.lock"),
+        {"mode": "시험" if a.test else "실사용", "minutes": a.minutes,
+         "note": f"levels={os.path.basename(a.levels)}"})
+    if _lock_fd is None:
+        print("[중단] 이미 감시가 실행 중입니다. 새 감시를 시작하지 않습니다.", flush=True)
+        print(f"  · 기존 실행: {single_lock.describe(_prev)}", flush=True)
+        print("  · 기존 감시는 그대로 둡니다(자동 종료하지 않음).", flush=True)
+        print("  · 새로 시작하려면 기존 감시 터미널 창을 먼저 닫은 뒤 다시 실행하세요.", flush=True)
+        raise SystemExit(4)
+    # _lock_fd 는 닫지 않는다 — 프로세스 종료 시 OS 가 자동 해제한다.
     if a.symbols:
         syms = [s.strip().upper() for s in a.symbols.split(",")]
     else:
