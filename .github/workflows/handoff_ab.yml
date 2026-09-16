@@ -1,0 +1,31 @@
+name: turtle-handoff-ab
+# 실제 A→B 인계 1회 검증(판호 3단계). 가상 입력, 텔레그램은 목(실발송 없음).
+# 상태는 비공개 저장소 turtle-state 에 저장/인계. 토큰은 Secret(STATE_REPO_TOKEN)에서만 사용.
+on:
+  workflow_dispatch:
+    inputs:
+      role:
+        description: "인계 역할 — 먼저 A 실행, 끝나면 다시 B 실행"
+        required: true
+        type: choice
+        options: [A, B]
+        default: A
+
+jobs:
+  handoff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 원격 인계 실행 (role=${{ inputs.role }})
+        env:
+          STATE_REPO_TOKEN: ${{ secrets.STATE_REPO_TOKEN }}
+        run: |
+          if [ -z "$STATE_REPO_TOKEN" ]; then
+            echo "::error::STATE_REPO_TOKEN Secret 이 없습니다. turtle-actions Settings에 등록됐는지 확인하세요."
+            exit 2
+          fi
+          export STATE_REMOTE="https://x-access-token:${STATE_REPO_TOKEN}@github.com/inchul12-oss/turtle-state.git"
+          python3 live/remote_handoff_run.py --role "${{ inputs.role }}"

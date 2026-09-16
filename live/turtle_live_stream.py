@@ -23,9 +23,20 @@ import threading
 import time
 from collections import Counter
 from datetime import datetime, timezone, timedelta, date
+from zoneinfo import ZoneInfo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "out_yahoo")
+
+# 미국 동부 시간대(서머타임 자동: EDT/EST). 정규장 판정과 실행 일정이 같은 기준을 쓴다.
+ET_ZONE = ZoneInfo("America/New_York")
+
+
+def _et(dt_utc: datetime) -> datetime:
+    """UTC(또는 tz-aware) 시각 → 미국 동부 시각. 서머타임 자동 반영."""
+    if dt_utc.tzinfo is None:
+        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+    return dt_utc.astimezone(ET_ZONE)
 
 # 미국 증시 휴장일(2026, NYSE/Nasdaq). 기대 최종 완결 거래일 계산용(주말+휴장 제외).
 KNOWN_HOLIDAYS = {
@@ -45,8 +56,8 @@ def expected_last_completed_trading_day(today: date) -> date:
 
 def in_regular_session(dt_utc) -> bool:
     """정규장(미국 동부 09:30~16:00, 주말·휴장 제외) 여부. 실사용 판정은 정규장 틱만 사용.
-    프리마켓·애프터장 틱은 제외(터틀은 '장중' 돌파/청산 기준). ET=UTC-4(기존 코드와 동일 기준)."""
-    et = dt_utc - timedelta(hours=4)
+    프리마켓·애프터장 틱은 제외(터틀은 '장중' 돌파/청산 기준). ET은 America/New_York(서머타임 자동)."""
+    et = _et(dt_utc)
     if et.weekday() >= 5 or et.strftime("%Y-%m-%d") in KNOWN_HOLIDAYS:
         return False
     m = et.hour * 60 + et.minute
@@ -77,7 +88,7 @@ def basis_date(levels: dict) -> str:
 
 
 def et_date(ts_ms: int) -> str:
-    return (datetime.fromtimestamp(ts_ms / 1000, timezone.utc) - timedelta(hours=4)).strftime("%Y-%m-%d")
+    return _et(datetime.fromtimestamp(ts_ms / 1000, timezone.utc)).strftime("%Y-%m-%d")
 
 
 def load_security_class(path: str) -> dict:
@@ -103,7 +114,7 @@ def run(symbols, levels, per_conn, minutes, gap=1.0, join_timeout=5.0, sec_class
     ev_path = os.path.join(OUT, f"entry_events_{stamp}.csv")
     raw_path = os.path.join(OUT, f"stream_live_{stamp}.jsonl")
     sum_path = os.path.join(OUT, f"live_summary_{stamp}.json")
-    today_et = (datetime.now(timezone.utc) - timedelta(hours=4)).strftime("%Y-%m-%d")
+    today_et = _et(datetime.now(timezone.utc)).strftime("%Y-%m-%d")
 
     tradable_all = {s for s, v in levels.items() if v["status"] == "정상" and v["entry"] == v["entry"]}
     need_check = {s for s, v in levels.items() if not (v["status"] == "정상" and v["entry"] == v["entry"])}
@@ -215,7 +226,7 @@ def run(symbols, levels, per_conn, minutes, gap=1.0, join_timeout=5.0, sec_class
                         _mu = datetime.fromtimestamp(int(str(t)) / 1000, timezone.utc)  # 시세(체결) 시각
                         ev = {"recv_utc": now, "symbol": sym, "entry_level": lv["entry"], "recv_price": px,
                               "msg_time_utc": _mu.strftime("%Y-%m-%d %H:%M:%S"),
-                              "msg_time_et": (_mu - timedelta(hours=4)).strftime("%Y-%m-%d %H:%M:%S"),
+                              "msg_time_et": _et(_mu).strftime("%Y-%m-%d %H:%M:%S"),
                               "data_status": "정상", "universe_class": "보통주", "first_obs_already_over": already, "conn": conn_no}
                         events.append(ev); evw.writerow(ev); evf.flush()
                         tag = "첫 관측부터 기준가 이상" if already else "관측 중 기준가 도달"
@@ -253,7 +264,7 @@ def run(symbols, levels, per_conn, minutes, gap=1.0, join_timeout=5.0, sec_class
     obs_start = time.time()
     basis = basis_date(levels)
     now_local = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    now_et = (datetime.now(timezone.utc) - timedelta(hours=4)).strftime("%H:%M ET")
+    now_et = _et(datetime.now(timezone.utc)).strftime("%H:%M %Z")
     fresh = basis == exp
     fresh_note = "최신(기대일과 일치)" if fresh else f"불일치 → 갱신 필요"
     print(f"[기준가 계산 기준일] {basis} (마지막 완결 일봉) · 기대 최종 완결 거래일 {exp} → {fresh_note}", flush=True)
