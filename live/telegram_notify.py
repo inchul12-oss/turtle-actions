@@ -72,30 +72,33 @@ class Notifier:
             self.worker.start()
 
     def _load_sent(self):
+        # 중복방지 키는 문자열. 진입 알림 기본키 = "SYM|us_date". 보유 알림은 enqueue(dedup_key=...) 로 상세키 전달.
+        # 예전 형식(키 열 없음) 파일도 SYM|us_date 로 복원해 그대로 호환.
         s = set()
         if os.path.exists(self.hist_path):
             try:
                 for r in csv.DictReader(open(self.hist_path)):
                     if r.get("status") == "sent":
-                        s.add((r.get("symbol"), r.get("us_date")))
+                        s.add(r.get("key") or f'{r.get("symbol")}|{r.get("us_date")}')
             except Exception:
                 pass
         return s
 
     def already_sent(self, sym: str) -> bool:
-        return (sym, self.us_date) in self.sent
+        return f"{sym}|{self.us_date}" in self.sent
 
-    def enqueue(self, sym: str, text: str) -> str:
-        """발송 큐에 넣는다(논블로킹). 이미 성공 발송/큐 대기 중인 (종목,거래일)이면 skip."""
+    def enqueue(self, sym: str, text: str, dedup_key: str = None) -> str:
+        """발송 큐에 넣는다(논블로킹). 이미 성공 발송/큐 대기 중인 키면 skip.
+        dedup_key 미지정 시 (종목,거래일). 보유 알림은 종류·유닛·기준선서명이 담긴 키를 넘긴다."""
         if not self.enabled:
             return "disabled"
+        key = dedup_key or f"{sym}|{self.us_date}"
         with self.lock:
-            key = (sym, self.us_date)
             if key in self.sent or key in self._queued:
                 self.stats["dup_skip"] += 1
                 return "dup_skip"
             self._queued.add(key)
-        self.q.put((sym, text))
+        self.q.put((sym, text, key))
         return "queued"
 
     def _post(self, text: str) -> bool:
@@ -111,7 +114,7 @@ class Notifier:
     def _run(self):
         while not (self._stop and self.q.empty()):
             try:
-                sym, text = self.q.get(timeout=0.5)
+                sym, text, key = self.q.get(timeout=0.5)
             except queue.Empty:
                 continue
             status, err = "failed", None
@@ -128,15 +131,16 @@ class Notifier:
                     status, err = "failed", f"{type(e).__name__}: {e}"
                 if attempt < self.max_retry:
                     time.sleep(1.5 * attempt)
-            self._record(sym, status, err)
+            self._record(sym, status, err, key)
             if status == "sent":
                 with self.lock:
-                    self.sent.add((sym, self.us_date))
+                    self.sent.add(key)
             self.q.task_done()
 
-    def _record(self, sym, status, err):
+    def _record(self, sym, status, err, key=None):
+        key = key or f"{sym}|{self.us_date}"
         row = {"utc": datetime.now(timezone.utc).isoformat(), "symbol": sym,
-               "us_date": self.us_date, "status": status, "error": err}
+               "us_date": self.us_date, "status": status, "error": err, "key": key}
         try:
             with open(self.log_path, "a") as f:
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -146,8 +150,8 @@ class Notifier:
         with open(self.hist_path, "a", newline="") as f:
             w = csv.writer(f)
             if newfile:
-                w.writerow(["utc", "symbol", "us_date", "status", "error"])
-            w.writerow([row["utc"], sym, self.us_date, status, err or ""])
+                w.writerow(["utc", "symbol", "us_date", "status", "error", "key"])
+            w.writerow([row["utc"], sym, self.us_date, status, err or "", key])
         self.stats[status] += 1
 
     def send_raw(self, text: str) -> str:
@@ -179,3 +183,21 @@ def build_message(sym, entry, px, basis_date, msg_utc_dt, already) -> str:
             f"기준가 계산일: {basis_date}\n"
             f"시세시각(KST): {kst}\n"
             f"{typ}")
+
+
+def build_holding_message(alert, n, msg_utc_dt, test=False) -> str:
+    """보유관리 알림 메시지(진입후보와 다른 머리말). 실제 보유 알림엔 [테스트] 안 붙임.
+    alert: holding_alerts.Alert. n: 캠페인 N. test=True 면 [테스트] 접두(실사용과 구분)."""
+    from datetime import timedelta
+    kst = (msg_utc_dt + timedelta(hours=9)).strftime("%Y-%m-%d %H:%M:%S KST")
+    head = "[테스트] " if test else ""
+    units = (" / ".join(alert.units)) if alert.units else "-"
+    tag = " · 첫 관측부터 조건 충족(돌파 순간 포착 아님)" if alert.already else ""
+    side = "매수" if alert.kind == "ADD" else "매도"
+    return (f"{head}[보유관리·{side}] {alert.symbol} — {alert.text_kind}\n"
+            f"기준선: {alert.line}\n"
+            f"관측가: {alert.price}\n"
+            f"대상 유닛: {units}\n"
+            f"캠페인 N: {n}\n"
+            f"시세시각(KST): {kst}{tag}\n"
+            f"※ 자동주문 아님 · 실제 체결 입력(positions.csv) 기준 알림")

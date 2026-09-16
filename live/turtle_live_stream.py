@@ -44,16 +44,18 @@ def expected_last_completed_trading_day(today: date) -> date:
 
 
 def load_levels(path: str) -> dict:
-    """levels.csv → {sym: {entry, status, as_of}}. status=='정상' 이고 entry 유효한 것만 판정 대상."""
+    """levels.csv → {sym: {entry, status, as_of, exit_level}}. status=='정상' 이고 entry 유효한 것만 진입 판정 대상.
+    exit_level(L20−틱)은 보유관리 L20 청산 판정에 재사용."""
     lv = {}
+    def _f(x):
+        try:
+            return float(x) if x not in (None, "", "nan") else float("nan")
+        except ValueError:
+            return float("nan")
     with open(path, newline="") as f:
         for r in csv.DictReader(f):
-            e = r.get("entry_level")
-            try:
-                entry = float(e) if e not in (None, "", "nan") else float("nan")
-            except ValueError:
-                entry = float("nan")
-            lv[r["symbol"]] = {"entry": entry, "status": r.get("status", ""), "as_of": r.get("as_of", "")}
+            lv[r["symbol"]] = {"entry": _f(r.get("entry_level")), "status": r.get("status", ""),
+                               "as_of": r.get("as_of", ""), "exit_level": _f(r.get("exit_level"))}
     return lv
 
 
@@ -83,7 +85,7 @@ def load_security_class(path: str) -> dict:
     return sc
 
 
-def run(symbols, levels, per_conn, minutes, gap=1.0, join_timeout=5.0, sec_class=None, notify=True):
+def run(symbols, levels, per_conn, minutes, gap=1.0, join_timeout=5.0, sec_class=None, notify=True, positions_path=None, test=False):
     import yfinance as yf
     sec_class = sec_class or {}
     os.makedirs(OUT, exist_ok=True)
@@ -118,11 +120,33 @@ def run(symbols, levels, per_conn, minutes, gap=1.0, join_timeout=5.0, sec_class
     tradable_unqueried = tradable - noncommon - unverified - confirmed_common    # 가격O, 미조회 = 종류 미확인
     common_ok = tradable_confirmed                                              # 확정 후보 풀 = 가격 계산 가능 AND 보통주 확인
 
+    # ---- 보유관리(통합지시 3): 실제 체결(positions.csv 또는 Secret) 기반 add/stop/L20 알림 ----
+    import holding_alerts as haal
+    fills_by_sym = haal.load_fills(positions_path)          # 로컬 CSV 또는 POSITIONS_CSV_B64(Secret)
+    hold_campaigns = {}; hold_flags = {}
+    for hsym, fl in fills_by_sym.items():
+        exlv = levels.get(hsym, {}).get("exit_level")
+        exlv = exlv if (exlv is not None and exlv == exlv) else None      # NaN→None
+        camp = haal.build_campaign(hsym, fl, exlv, today_et)
+        hold_campaigns[hsym] = camp
+        if not camp.ok:
+            hold_flags[hsym] = camp.reason
+    held_syms = {s for s, c in hold_campaigns.items() if c.ok}
+    hold_watcher = haal.HoldingWatcher(hold_campaigns, today_et) if hold_campaigns else None
+    for s in held_syms:                                     # 보유 종목은 후보 풀과 무관하게 수신 대상에 포함
+        if s not in symbols:
+            symbols.append(s)
+
     groups = [symbols[i:i + per_conn] for i in range(0, len(symbols), per_conn)]
     counts = Counter(); today_counts = Counter(); first_today_price = {}; lat = {}
-    events = []; signaled = set(); lock = threading.Lock()
+    events = []; hold_events = []; signaled = set(); lock = threading.Lock()
     import telegram_notify as tn
-    notifier = tn.Notifier(OUT, today_et) if notify else None
+    if not notify:
+        notifier = None
+    elif test:      # 시험 모드: 보유 메시지 [테스트] 접두 + 별도 이력, 실 진입알림 발송 안 함
+        notifier = tn.Notifier(OUT, today_et, log_name="telegram_log_holdtest.jsonl", hist_name="sent_history_holdtest.csv")
+    else:
+        notifier = tn.Notifier(OUT, today_et)
     raw = open(raw_path, "w")
     evf = open(ev_path, "w", newline="")
     evw = csv.DictWriter(evf, fieldnames=["recv_utc", "symbol", "entry_level", "recv_price", "msg_time_utc", "msg_time_et", "data_status", "universe_class", "first_obs_already_over", "conn"])
@@ -150,6 +174,20 @@ def run(symbols, levels, per_conn, minutes, gap=1.0, join_timeout=5.0, sec_class
                     today_counts[sym] += 1
                     if l is not None:
                         lat.setdefault(sym, []).append(l)
+                    # 보유관리 알림(후보 풀과 독립). observe 가 체결시각 이후 틱만 판정.
+                    if hold_watcher and px is not None and sym in held_syms:
+                        try:
+                            _ot = datetime.fromtimestamp(int(str(t)) / 1000, timezone.utc)   # 시세(관측) 시각
+                            for al in hold_watcher.observe(sym, float(px), _ot):
+                                camp = hold_campaigns[sym]
+                                stg = (notifier.enqueue(sym, tn.build_holding_message(al, camp.n, _ot, test=test), dedup_key=al.key)
+                                       if (notifier and notifier.enabled) else "off")
+                                hold_events.append({"recv_utc": now, "symbol": sym, "kind": al.kind, "text_kind": al.text_kind,
+                                                    "line": al.line, "recv_price": float(px), "units": "/".join(al.units),
+                                                    "already": al.already, "telegram": stg, "conn": conn_no})
+                                print(f"  ★ 보유관리 {sym} {al.text_kind}  관측 {px} 기준 {al.line}  [{'첫관측부터' if al.already else '관측중'}]  {now[11:19]}", flush=True)
+                        except Exception:
+                            pass
                     lv = levels.get(sym)
                     if px is None or not lv or lv["status"] != "정상" or lv["entry"] != lv["entry"]:
                         return
@@ -171,7 +209,7 @@ def run(symbols, levels, per_conn, minutes, gap=1.0, join_timeout=5.0, sec_class
                         events.append(ev); evw.writerow(ev); evf.flush()
                         tag = "첫 관측부터 기준가 이상" if already else "관측 중 기준가 도달"
                         print(f"  ▶ 진입후보 {sym}  수신 {px} ≥ 기준 {lv['entry']}  [{tag}]  {now[11:19]}", flush=True)
-                        if notifier and notifier.enabled:   # 발송은 큐로(논블로킹) → 수신 안 막힘, 같은 날 중복 skip
+                        if notifier and notifier.enabled and not test:   # 시험모드에선 실 진입알림 발송 안 함(보유 연결시험 격리)
                             st = notifier.enqueue(sym, tn.build_message(sym, lv["entry"], px, basis, _mu, already))
                             ev["telegram"] = st
             except Exception as e:
@@ -260,6 +298,10 @@ def run(symbols, levels, per_conn, minutes, gap=1.0, join_timeout=5.0, sec_class
         "entry_first_obs_already_over": sum(1 for e in events if e["first_obs_already_over"]),
         "entry_crossed_during_watch": sum(1 for e in events if not e["first_obs_already_over"]),
         "threads_not_joined": not_joined, "messages_total": sum(counts.values()),
+        "holding_watched": sorted(held_syms), "holding_alerts": len(hold_events),
+        "holding_alerts_detail": hold_events,
+        "holding_needs_input": hold_flags,   # N 입력 필요 / 체결시각 입력 필요 / campaign_id 누락 등
+        "holding_needs_time_runtime": (hold_watcher.needs_time_flagged if hold_watcher else {}),
         "telegram": tel,
         "files": {"events": ev_path, "raw": raw_path},
         "note": "자동 주문 없음. 오늘 체결 메시지만 판정. 옛 스냅샷 제외. 신호는 종목·날짜당 최초 1회. 야후 실시간=미국 거래량 일부 → 첫 틱 보장 아님. 미수신 종목은 이번 세션에 도착 안 한 것일 뿐 향후 수신을 보장하지 않음",
@@ -271,6 +313,9 @@ def run(symbols, levels, per_conn, minutes, gap=1.0, join_timeout=5.0, sec_class
     print(f"[종류] 보통주 확인: {len(common_ok)}  |  대상 외: {len(tradable_noncommon)}  |  정체 미확인: {len(tradable_unverified)}  |  미조회(종류 미확인): {len(tradable_unqueried)}   ← '가격 계산 가능'과 별도 축")
     print(f"확정 후보 대상(가격가능 AND 보통주확인): {len(common_ok)}  |  그중 오늘 시세 수신: {tradable_recv_today}  미수신: {len(tradable)-tradable_recv_today} (이번 세션 미도착, 향후 수신 보장 아님)")
     print(f"진입 후보(오늘, 최초 1회, 보통주만): {len(events)}  (첫 관측부터 기준가 이상 {summary['entry_first_obs_already_over']} / 관측 중 도달 {summary['entry_crossed_during_watch']})")
+    print(f"[보유관리] 감시 {len(held_syms)}종목 · 알림 {len(hold_events)}건"
+          + (f" · 입력 필요 {len(hold_flags)}종목({', '.join(f'{k}:{v}' for k,v in list(hold_flags.items())[:4])})" if hold_flags else "")
+          + (f" · 체결시각 필요 {len(hold_watcher.needs_time_flagged)}" if (hold_watcher and hold_watcher.needs_time_flagged) else ""))
     print(f"이벤트 CSV: {ev_path}")
     if tel is not None:
         if tel["enabled"]:
@@ -293,7 +338,9 @@ if __name__ == "__main__":
     ap.add_argument("--minutes", type=float, default=30)
     ap.add_argument("--gap", type=float, default=1.0)
     ap.add_argument("--security-class", default=os.path.join(HERE, "security_class.csv"), help="종목 종류 분류표(보통주 확인/대상 외/미확인)")
+    ap.add_argument("--positions", default=os.path.join(HERE, "positions.csv"), help="실제 체결 CSV(보유관리 알림용). 없거나 POSITIONS_CSV_B64(Secret) 있으면 그쪽 사용")
     ap.add_argument("--no-telegram", action="store_true", help="텔레그램 발송 끄기(감시만)")
+    ap.add_argument("--test", action="store_true", help="시험모드: 보유 알림 [테스트] 접두+별도 이력, 실 진입알림 발송 안 함")
     a = ap.parse_args()
     if a.symbols:
         syms = [s.strip().upper() for s in a.symbols.split(",")]
@@ -301,4 +348,4 @@ if __name__ == "__main__":
         syms = [l.strip().upper() for l in open(a.symbols_file) if l.strip() and not l.startswith("#")]
     if not os.path.exists(a.levels):
         raise SystemExit(f"기준가표 없음: {a.levels} — 먼저 yahoo_daily.py → turtle_levels.py 로 생성")
-    run(syms, load_levels(a.levels), a.per_conn, a.minutes, gap=a.gap, sec_class=load_security_class(a.security_class), notify=not a.no_telegram)
+    run(syms, load_levels(a.levels), a.per_conn, a.minutes, gap=a.gap, sec_class=load_security_class(a.security_class), notify=not a.no_telegram, positions_path=a.positions, test=a.test)
