@@ -43,6 +43,16 @@ def expected_last_completed_trading_day(today: date) -> date:
     return d
 
 
+def in_regular_session(dt_utc) -> bool:
+    """정규장(미국 동부 09:30~16:00, 주말·휴장 제외) 여부. 실사용 판정은 정규장 틱만 사용.
+    프리마켓·애프터장 틱은 제외(터틀은 '장중' 돌파/청산 기준). ET=UTC-4(기존 코드와 동일 기준)."""
+    et = dt_utc - timedelta(hours=4)
+    if et.weekday() >= 5 or et.strftime("%Y-%m-%d") in KNOWN_HOLIDAYS:
+        return False
+    m = et.hour * 60 + et.minute
+    return 570 <= m < 960          # 09:30(570) ~ 16:00(960)
+
+
 def load_levels(path: str) -> dict:
     """levels.csv → {sym: {entry, status, as_of, exit_level}}. status=='정상' 이고 entry 유효한 것만 진입 판정 대상.
     exit_level(L20−틱)은 보유관리 L20 청산 판정에 재사용."""
@@ -159,9 +169,10 @@ def run(symbols, levels, per_conn, minutes, gap=1.0, join_timeout=5.0, sec_class
                     msg = dict(msg)
                 sym = msg.get("id") or msg.get("symbol")
                 now_dt = datetime.now(timezone.utc); now = now_dt.isoformat()
-                t = msg.get("time"); is_today = False; msg_et = None; l = None
+                t = msg.get("time"); is_today = False; msg_et = None; l = None; sess_ok = False
                 try:
                     tms = int(str(t)); msg_et = et_date(tms); is_today = msg_et == today_et
+                    sess_ok = in_regular_session(datetime.fromtimestamp(tms / 1000, timezone.utc))
                     l = (now_dt - datetime.fromtimestamp(tms / 1000, timezone.utc)).total_seconds()
                 except Exception:
                     pass
@@ -174,8 +185,8 @@ def run(symbols, levels, per_conn, minutes, gap=1.0, join_timeout=5.0, sec_class
                     today_counts[sym] += 1
                     if l is not None:
                         lat.setdefault(sym, []).append(l)
-                    # 보유관리 알림(후보 풀과 독립). observe 가 체결시각 이후 틱만 판정.
-                    if hold_watcher and px is not None and sym in held_syms:
+                    # 보유관리 알림(후보 풀과 독립). 실사용은 정규장 틱만(시험모드는 장외 허용). observe 가 체결시각 이후 틱만 판정.
+                    if hold_watcher and px is not None and sym in held_syms and (test or sess_ok):
                         try:
                             _ot = datetime.fromtimestamp(int(str(t)) / 1000, timezone.utc)   # 시세(관측) 시각
                             for al in hold_watcher.observe(sym, float(px), _ot):
@@ -198,7 +209,7 @@ def run(symbols, levels, per_conn, minutes, gap=1.0, join_timeout=5.0, sec_class
                     px = float(px)
                     if sym not in first_today_price:
                         first_today_price[sym] = px   # 오늘 첫 수신가
-                    if px >= lv["entry"] and sym not in signaled:
+                    if px >= lv["entry"] and sym not in signaled and sess_ok:   # 진입도 정규장 틱만(장중 돌파 기준)
                         signaled.add(sym)
                         already = first_today_price[sym] >= lv["entry"]
                         _mu = datetime.fromtimestamp(int(str(t)) / 1000, timezone.utc)  # 시세(체결) 시각
